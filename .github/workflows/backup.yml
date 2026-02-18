@@ -1,0 +1,121 @@
+name: Sauvegarde hebdomadaire Supabase
+
+on:
+  schedule:
+    # Tous les 3 jours à 9h00 (heure Paris = UTC+1, donc 8h UTC)
+    - cron: '0 8 */3 * *'
+  workflow_dispatch: # Permet de lancer manuellement depuis GitHub
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+      
+      - name: Install Supabase client
+        run: npm install @supabase/supabase-js@1
+      
+      - name: Create backup script
+        run: |
+          cat > backup.js << 'EOF'
+          const { createClient } = require('@supabase/supabase-js');
+          const fs = require('fs');
+          
+          const supabase = createClient(
+            process.env.SUPABASE_URL,
+            process.env.SUPABASE_KEY
+          );
+          
+          async function backup() {
+            try {
+              console.log('🔄 Récupération des données Supabase...');
+              
+              const { data: missions, error: mError } = await supabase
+                .from('missions')
+                .select('*');
+              
+              if (mError) throw mError;
+              
+              const { data: metadata, error: metaError } = await supabase
+                .from('metadata')
+                .select('*');
+              
+              if (metaError) throw metaError;
+              
+              const backupData = {
+                date: new Date().toISOString(),
+                missions: missions || [],
+                metadata: metadata || [],
+                stats: {
+                  total_missions: missions?.length || 0,
+                  published: missions?.filter(m => m.status === 'published').length || 0,
+                  pending: missions?.filter(m => m.status === 'pending').length || 0
+                }
+              };
+              
+              const filename = `backup-rtb-${new Date().toISOString().split('T')[0]}.json`;
+              fs.writeFileSync(filename, JSON.stringify(backupData, null, 2));
+              
+              console.log('✅ Sauvegarde créée:', filename);
+              console.log('📊 Stats:', backupData.stats);
+              
+              // Créer le résumé pour l'email
+              const summary = `
+          📦 SAUVEGARDE ROAD TO BARCELONA
+          
+          Date: ${new Date().toLocaleString('fr-FR', { timeZone: 'Europe/Paris' })}
+          
+          📊 Statistiques:
+          - Total missions: ${backupData.stats.total_missions}
+          - Missions publiées: ${backupData.stats.published}
+          - Missions en attente: ${backupData.stats.pending}
+          
+          Le fichier JSON complet est en pièce jointe.
+          `;
+              
+              fs.writeFileSync('backup-summary.txt', summary);
+              
+              // Stocker le nom du fichier pour l'étape suivante
+              fs.writeFileSync('backup-filename.txt', filename);
+              
+            } catch (error) {
+              console.error('❌ Erreur:', error);
+              process.exit(1);
+            }
+          }
+          
+          backup();
+          EOF
+      
+      - name: Run backup
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: node backup.js
+      
+      - name: Send email with backup
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 587
+          username: ${{ secrets.EMAIL_USERNAME }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+          subject: "[Road to Barcelona] Sauvegarde hebdomadaire - ${{ github.run_number }}"
+          to: jeremie.martinot@freelance-informatique.fr
+          from: Road to Barcelona Backup <${{ secrets.EMAIL_USERNAME }}>
+          body: file://backup-summary.txt
+          attachments: backup-rtb-*.json
+      
+      - name: Upload backup as artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: backup-${{ github.run_number }}
+          path: backup-rtb-*.json
+          retention-days: 90
